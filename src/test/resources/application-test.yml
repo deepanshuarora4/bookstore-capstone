@@ -1,0 +1,8 @@
+# Test profile: H2 (PostgreSQL compatibility mode) is used for automated tests only.
+# The same Flyway migrations as production are applied, and Hibernate validates the entities against them.
+spring:
+  datasource:
+    url: jdbc:h2:mem:bookstore;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver

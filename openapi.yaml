@@ -1,0 +1,2061 @@
+openapi: 3.0.3
+info:
+  title: eCommerce Bookstore Backend API
+  version: 1.0.0
+  description: |
+    REST API for the IBM Applied AI Specialist - Cloud FullStack Capstone (eCommerce Bookstore).
+
+    **Stack:** Java 21, Spring Boot 3, Spring Data JPA, Spring Security (JJWT + BCrypt), PostgreSQL, Flyway.
+
+    ## Conventions
+    * All endpoints are served under the `/api/v1` server base path.
+    * Currency is **INR (₹)**. Monetary values are decimals with two fraction digits.
+    * Timestamps are ISO-8601 UTC; dates are `yyyy-MM-dd`.
+    * Authentication is a stateless JWT sent as `Authorization: Bearer <token>`.
+      Operations with `security: []` are public; every other operation requires a valid token.
+    * Customer-scoped resources (cart, addresses, orders, payments, gift points) are always resolved for the
+      authenticated user. Accessing another user's resource returns `404`, never `403`.
+    * Every error uses the single `ErrorResponse` body with a machine-readable `code`.
+      Unexpected failures return `500 INTERNAL_ERROR` with the same body (no stack trace, no request data).
+
+    ## IBM customer journey mapping (slide 3)
+    The `x-ibm-steps` extension on each operation lists the original IBM step numbers it supports.
+    Slide 3 prints steps 1, 2, 3, 5, 6, 7, 8, 9, 10, 11 and 12 (step 4 is not printed on the slide).
+    Items that sit inside a numbered IBM cell are exposed as lettered sub-steps.
+
+    | IBM step | IBM text (slide 3) | API coverage |
+    |---|---|---|
+    | 1 | Login Page | `POST /auth/login`, `POST /auth/register` |
+    | 2 | User Authentication | JWT issued by login, `GET /users/me` |
+    | 2a | User browses Order History with Buy In Again | `GET /orders`, `GET /orders/buy-again` |
+    | 2b | Recommends items based on Order History | `GET /recommendations` |
+    | 3 | Access Product catalogue for each category | `GET /products?categoryId=` |
+    | 5 | Select the Category of products | `GET /categories` |
+    | 6 | Browse the brands | `GET /brands`, `GET /brands/{brandId}/products` |
+    | 7 | Select the product (tagged with tentative delivery date) | `GET /products/{productId}` (`estimatedDeliveryDate`) |
+    | 7a | Related products appear for selection | `GET /products/{productId}/related` |
+    | 8 | Add the product(s) to basket | `/cart`, `/cart/items` |
+    | 9 | Select the address for delivery | `/addresses`, `addressId` in `POST /orders` |
+    | 10 | Initiate payment with the right option | `POST /orders` then `POST /orders/{orderId}/payments` (credit / debit card) |
+    | 10a | Redeem gift points | `pointsToRedeem` in `POST /orders`, `GET /gift-points` |
+    | 11 | Payment confirmation | `POST /orders/{orderId}/payments` response, `GET /orders/{orderId}/payment` |
+    | 12 | Confirmation on purchase | `GET /orders/{orderId}`, confirmation message in the payment response |
+    | 12a | Cancel Order within 48 hrs | `POST /orders/{orderId}/cancel` |
+
+    `/admin/**` operations only maintain catalogue data that the journeys above consume.
+
+    ## Configurable business rules (application properties)
+    | Rule | Property | Default |
+    |---|---|---|
+    | Points earned per spend unit | `bookstore.points.earn-points-per-unit` | 1 |
+    | Spend unit (₹) | `bookstore.points.earn-spend-unit` | 10 |
+    | Value of one point (₹) | `bookstore.points.point-value` | 1 |
+    | Max redemption, % of subtotal | `bookstore.points.max-redemption-percent` | 50 |
+    | Cancellation window (hours) | `bookstore.order.cancellation-window-hours` | 48 |
+    | Delivery transit days | `bookstore.delivery.transit-days` | 3 |
+    | Max quantity per cart line | `bookstore.cart.max-quantity-per-item` | 10 |
+    | Simulated decline card suffix | `bookstore.payment.decline-card-suffix` | `0002` |
+    | JWT expiry (seconds) | `bookstore.security.jwt.expiry-seconds` | 3600 |
+
+    `max-redemption-percent` is validated at startup to be between 0 and 50 inclusive, so the payable total of an
+    order is always greater than zero and every order goes through the payment step.
+
+    ## Gift point safety rules
+    * Balance is never negative: redemption is rejected when it exceeds the balance, and a cancellation reversal of
+      earned points is capped at the current balance.
+    * No duplicate deductions: at most one `REDEEM`, one `EARN`, one `REFUND` and one `REVERSE` ledger entry per order,
+      enforced by a unique constraint and the account row version. Order placement, stock updates and point
+      operations occur in a single database transaction.
+
+    ## Card data protection
+    * `cardNumber` and `cvv` are write-only request fields. They are used for in-memory validation and the simulated
+      gateway call only. They are never persisted, never returned in any response, never included in error
+      messages or `fieldErrors`, and never logged (request-body logging is disabled for payment endpoints).
+    * Only `cardLast4` is persisted and returned.
+  contact:
+    name: Bookstore Capstone
+  license:
+    name: Educational use only
+    url: https://www.ibm.com/legal
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development
+
+tags:
+  - name: Auth
+    description: Registration, login and current user (IBM steps 1, 2)
+  - name: Catalogue
+    description: Categories, products and related products (IBM steps 3, 5, 7, 7a)
+  - name: Brands
+    description: Brands / publishers (IBM step 6)
+  - name: Cart
+    description: Shopping basket (IBM step 8)
+  - name: Addresses
+    description: Delivery addresses (IBM step 9)
+  - name: Orders
+    description: Order placement, history, Buy Again and cancellation (IBM steps 2a, 9, 10, 10a, 12, 12a)
+  - name: Payments
+    description: Simulated card payment and confirmation (IBM steps 10, 11, 12)
+  - name: Gift Points
+    description: Gift point balance and ledger (IBM step 10a)
+  - name: Recommendations
+    description: Recommendations based on order history (IBM step 2b)
+  - name: Admin
+    description: Minimal catalogue maintenance for role ADMIN
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ------------------------------------------------------------------ AUTH
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerUser
+      summary: Register a new customer account
+      description: |
+        Creates a CUSTOMER account with a BCrypt-hashed password and an empty gift point account.
+        The user then signs in through `/auth/login`.
+      x-ibm-steps: ['1']
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              fullName: Deepanshu Arora
+              email: deepanshu.arora@example.com
+              password: Str0ngPass1
+              phone: '9876543210'
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Authenticate and obtain a JWT
+      description: |
+        Returns a signed JWT. A failed login always returns the generic `AUTHENTICATION_FAILED` message
+        without revealing whether the email exists.
+
+        A password longer than 72 bytes (UTF-8) can never have been registered, so it is treated like any other
+        wrong password and returns the same `401 AUTHENTICATION_FAILED`, not `400`. The login password therefore
+        has no `maxLength`.
+      x-ibm-steps: ['1', '2']
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: deepanshu.arora@example.com
+              password: Str0ngPass1
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /users/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Get the authenticated user's profile
+      x-ibm-steps: ['2']
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------- CATALOGUE
+  /categories:
+    get:
+      tags: [Catalogue]
+      operationId: listCategories
+      summary: List all product categories
+      x-ibm-steps: ['5']
+      security: []
+      responses:
+        '200':
+          description: All categories
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Category'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /products:
+    get:
+      tags: [Catalogue]
+      operationId: listProducts
+      summary: Browse the product catalogue
+      description: |
+        Paginated list of active products. Filter by category (IBM step 3), brand (IBM step 6) and/or free-text
+        search on title, author or ISBN. Every product carries a tentative `estimatedDeliveryDate` (IBM step 7).
+      x-ibm-steps: ['3', '6', '7']
+      security: []
+      parameters:
+        - name: categoryId
+          in: query
+          description: Restrict to a category
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: brandId
+          in: query
+          description: Restrict to a brand / publisher
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: q
+          in: query
+          description: Case-insensitive search on title, author or ISBN
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: sort
+          in: query
+          description: Sort order
+          schema:
+            type: string
+            default: title_asc
+            enum: [title_asc, title_desc, price_asc, price_desc, newest]
+      responses:
+        '200':
+          description: Page of products
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /products/{productId}:
+    get:
+      tags: [Catalogue]
+      operationId: getProduct
+      summary: Get product details with tentative delivery date
+      description: |
+        `estimatedDeliveryDate = today + product dispatch days + bookstore.delivery.transit-days`.
+      x-ibm-steps: ['7']
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: Product
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /products/{productId}/related:
+    get:
+      tags: [Catalogue]
+      operationId: getRelatedProducts
+      summary: Get related products
+      description: |
+        Derived, with no relation table: active, in-stock products that share the category or the brand of the
+        given product, excluding the product itself. Products matching both category and brand rank first.
+      x-ibm-steps: ['7a']
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Related products
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ---------------------------------------------------------------- BRANDS
+  /brands:
+    get:
+      tags: [Brands]
+      operationId: listBrands
+      summary: List brands / publishers
+      x-ibm-steps: ['6']
+      security: []
+      responses:
+        '200':
+          description: All brands
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Brand'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /brands/{brandId}/products:
+    get:
+      tags: [Brands]
+      operationId: listProductsByBrand
+      summary: List products of a brand
+      x-ibm-steps: ['6', '7']
+      security: []
+      parameters:
+        - name: brandId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Page of products
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------ CART
+  /cart:
+    get:
+      tags: [Cart]
+      operationId: getCart
+      summary: View the basket
+      description: |
+        Returns the basket with line totals, the subtotal, the latest tentative delivery date and
+        `maxRedeemablePoints`: the most gift points usable at checkout for the current subtotal and balance.
+      x-ibm-steps: ['8', '10a']
+      responses:
+        '200':
+          description: Current cart (empty when nothing was added)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CartResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [Cart]
+      operationId: clearCart
+      summary: Remove all items from the basket
+      x-ibm-steps: ['8']
+      responses:
+        '204':
+          description: Cart cleared
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /cart/items:
+    post:
+      tags: [Cart]
+      operationId: addCartItem
+      summary: Add a product to the basket
+      description: |
+        Adding a product that is already in the basket increases its quantity. The resulting quantity must not
+        exceed available stock or `bookstore.cart.max-quantity-per-item` (`INSUFFICIENT_STOCK` / `VALIDATION_FAILED`).
+        Inactive products cannot be added (`PRODUCT_INACTIVE`).
+      x-ibm-steps: ['8']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CartItemAddRequest'
+            example:
+              productId: 12
+              quantity: 2
+      responses:
+        '201':
+          description: Item added; the updated cart is returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CartResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /cart/items/{productId}:
+    put:
+      tags: [Cart]
+      operationId: updateCartItem
+      summary: Set the quantity of a basket item
+      x-ibm-steps: ['8']
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CartItemUpdateRequest'
+            example:
+              quantity: 3
+      responses:
+        '200':
+          description: Updated cart
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CartResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [Cart]
+      operationId: removeCartItem
+      summary: Remove a product from the basket
+      x-ibm-steps: ['8']
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: Updated cart
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CartResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------- ADDRESSES
+  /addresses:
+    get:
+      tags: [Addresses]
+      operationId: listAddresses
+      summary: List my delivery addresses
+      x-ibm-steps: ['9']
+      responses:
+        '200':
+          description: Addresses of the authenticated user
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Address'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [Addresses]
+      operationId: createAddress
+      summary: Add a delivery address
+      description: |
+        If `isDefault` is true, the previous default address is unset. The first address of a user automatically
+        becomes the default.
+      x-ibm-steps: ['9']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressRequest'
+            example:
+              label: Home
+              line1: 12 MG Road
+              line2: Indiranagar
+              city: Bengaluru
+              state: Karnataka
+              postalCode: '560038'
+              country: India
+              isDefault: true
+      responses:
+        '201':
+          description: Address created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /addresses/{addressId}:
+    parameters:
+      - $ref: '#/components/parameters/AddressId'
+    get:
+      tags: [Addresses]
+      operationId: getAddress
+      summary: Get one of my addresses
+      x-ibm-steps: ['9']
+      responses:
+        '200':
+          description: Address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      tags: [Addresses]
+      operationId: updateAddress
+      summary: Update one of my addresses
+      description: Existing orders keep their own address snapshot and are not affected.
+      x-ibm-steps: ['9']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressRequest'
+      responses:
+        '200':
+          description: Updated address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [Addresses]
+      operationId: deleteAddress
+      summary: Delete one of my addresses
+      description: Soft delete. Past orders keep their address snapshot.
+      x-ibm-steps: ['9']
+      responses:
+        '204':
+          description: Address deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ---------------------------------------------------------------- ORDERS
+  /orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Place an order from the basket (checkout step 1 of 2)
+      description: |
+        Runs in **one database transaction**:
+        1. Validates that the basket is not empty (`EMPTY_CART`) and that the address belongs to the user.
+        2. Re-checks and **decrements stock** for every line. `INSUFFICIENT_STOCK` rolls everything back.
+        3. Snapshots product title, product price and the delivery address.
+        4. Redeems `pointsToRedeem` (IBM step 10a). The value must not exceed the balance
+           (`INSUFFICIENT_GIFT_POINTS`) or `max-redemption-percent` of the subtotal (`POINTS_LIMIT_EXCEEDED`).
+           Points are debited immediately and written once to the gift point ledger.
+        5. Creates the order with status `PENDING_PAYMENT` and clears the basket.
+
+        Because redemption is capped below 100% of the subtotal, `totalAmount` is always greater than zero and the
+        order always requires payment through `POST /orders/{orderId}/payments` (IBM steps 10, 11).
+      x-ibm-steps: ['9', '10', '10a']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            example:
+              addressId: 5
+              pointsToRedeem: 100
+      responses:
+        '201':
+          description: Order created with status PENDING_PAYMENT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: Order history
+      description: The authenticated user's orders, newest first.
+      x-ibm-steps: ['2a']
+      parameters:
+        - name: status
+          in: query
+          description: Optional status filter
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Page of order summaries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderSummaryPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /orders/buy-again:
+    get:
+      tags: [Orders]
+      operationId: getBuyAgain
+      summary: Buy Again suggestions
+      description: |
+        Distinct products from the user's non-cancelled past orders, most recently ordered first, limited to
+        products that are still active and in stock.
+      x-ibm-steps: ['2a']
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Previously purchased products
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BuyAgainItem'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /orders/{orderId}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Get order details
+      description: Used for the purchase confirmation view (IBM step 12) and for order history detail (IBM step 2a).
+      x-ibm-steps: ['2a', '12']
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /orders/{orderId}/cancel:
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel an order within the cancellation window
+      description: |
+        Allowed only when `now - placedAt <= bookstore.order.cancellation-window-hours` (default 48 hours) and the
+        status is `PENDING_PAYMENT` or `CONFIRMED`. In one transaction: status becomes `CANCELLED`, stock is
+        restored, redeemed points are refunded (`REFUND`), earned points are reversed (`REVERSE`, capped at the
+        current balance so it never goes negative) and a successful payment is marked `REFUNDED`.
+        Each effect is applied at most once.
+
+        Errors: `CANCELLATION_WINDOW_EXPIRED`, `INVALID_ORDER_STATE` (already cancelled, shipped or delivered).
+      x-ibm-steps: ['12a']
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequest'
+      responses:
+        '200':
+          description: Order cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------- PAYMENTS
+  /orders/{orderId}/payments:
+    post:
+      tags: [Payments]
+      operationId: initiatePayment
+      summary: Initiate a simulated card payment (checkout step 2 of 2)
+      description: |
+        Allowed only when the order is `PENDING_PAYMENT`. Accepts **CREDIT_CARD** or **DEBIT_CARD**.
+
+        Validation (`400 INVALID_PAYMENT_DETAILS` or `400 VALIDATION_FAILED`):
+        * card number is 13 to 19 digits and passes the Luhn check;
+        * expiry is checked dynamically against the server clock: the card is valid through the last day of
+          `expiryMonth`/`expiryYear`, so it is rejected when that month is before the current month and year;
+        * CVV is 3 or 4 digits.
+
+        `cardNumber` and `cvv` are used in memory only. They are never stored, returned, logged or echoed in
+        errors. Only `cardLast4` is persisted.
+
+        Simulation: a card number ending with `bookstore.payment.decline-card-suffix` (default `0002`) is
+        declined. Every other valid card succeeds.
+
+        On success, in one transaction: payment `SUCCESS`, order `CONFIRMED`, earned gift points credited once
+        (1 point per ₹10 of `totalAmount` by default). The response is the payment confirmation (IBM step 11)
+        and the purchase confirmation (IBM step 12).
+
+        On decline: `402 PAYMENT_DECLINED`. A `FAILED` payment record is kept and the order stays
+        `PENDING_PAYMENT`, so the customer can retry. A payment attempt on an order that is not
+        `PENDING_PAYMENT` returns `409 INVALID_ORDER_STATE`.
+      x-ibm-steps: ['10', '11', '12']
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+            example:
+              method: CREDIT_CARD
+              cardHolderName: Deepanshu Arora
+              cardNumber: '4111111111111111'
+              expiryMonth: 12
+              expiryYear: 2030
+              cvv: '123'
+      responses:
+        '201':
+          description: Payment successful. Payment and purchase confirmation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentConfirmationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentDeclined'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /orders/{orderId}/payment:
+    get:
+      tags: [Payments]
+      operationId: getOrderPayment
+      summary: Get the latest payment of an order
+      description: Returns the most recent payment attempt (status SUCCESS, FAILED or REFUNDED).
+      x-ibm-steps: ['11']
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Latest payment
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------ GIFT POINTS
+  /gift-points:
+    get:
+      tags: [Gift Points]
+      operationId: getGiftPoints
+      summary: Gift point balance, rules and ledger
+      description: |
+        Returns the balance, the active earn and redeem rules (so a client can render the redemption control) and a
+        paginated ledger, newest first. The balance is never negative.
+      x-ibm-steps: ['10a']
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Gift point account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GiftPointsResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------- RECOMMENDATIONS
+  /recommendations:
+    get:
+      tags: [Recommendations]
+      operationId: getRecommendations
+      summary: Product recommendations based on order history
+      description: |
+        Ranks active, in-stock products in the categories and brands of the user's purchased books that the user
+        has not bought yet. With no order history it falls back to the newest products.
+      x-ibm-steps: ['2b']
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Recommended products
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecommendedProduct'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ----------------------------------------------------------------- ADMIN
+  /admin/categories:
+    post:
+      tags: [Admin]
+      operationId: createCategory
+      summary: Create a category (ADMIN)
+      x-ibm-steps: ['5']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryRequest'
+      responses:
+        '201':
+          description: Category created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Category'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/brands:
+    post:
+      tags: [Admin]
+      operationId: createBrand
+      summary: Create a brand / publisher (ADMIN)
+      x-ibm-steps: ['6']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrandRequest'
+      responses:
+        '201':
+          description: Brand created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Brand'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/products:
+    post:
+      tags: [Admin]
+      operationId: createProduct
+      summary: Create a product (ADMIN)
+      x-ibm-steps: ['3', '7']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductRequest'
+      responses:
+        '201':
+          description: Product created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/products/{productId}:
+    put:
+      tags: [Admin]
+      operationId: updateProduct
+      summary: Update a product (ADMIN)
+      description: Price changes do not affect existing orders because orders hold price snapshots.
+      x-ibm-steps: ['3', '7']
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductRequest'
+      responses:
+        '200':
+          description: Product updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT obtained from `POST /auth/login`, signed HS256 with JJWT. Claims: `sub` (user id), `email`, `role`,
+        `iat`, `exp`. Send as `Authorization: Bearer <token>`.
+
+  # ------------------------------------------------------------ PARAMETERS
+  parameters:
+    Page:
+      name: page
+      in: query
+      description: Zero-based page index
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    Size:
+      name: size
+      in: query
+      description: Page size
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Limit:
+      name: limit
+      in: query
+      description: Maximum number of items to return
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 8
+    ProductId:
+      name: productId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    AddressId:
+      name: addressId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+
+  # ------------------------------------------------------------- RESPONSES
+  responses:
+    ValidationError:
+      description: |
+        Request failed validation (`VALIDATION_FAILED`) or violated a business input rule
+        (`INVALID_PAYMENT_DETAILS`, `EMPTY_CART`, `INSUFFICIENT_GIFT_POINTS`, `POINTS_LIMIT_EXCEEDED`).
+        Error messages never contain card numbers, CVV or passwords.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            timestamp: '2026-11-18T10:15:30Z'
+            status: 400
+            error: Bad Request
+            code: VALIDATION_FAILED
+            message: Request validation failed
+            path: /api/v1/auth/register
+            fieldErrors:
+              - field: email
+                message: must be a well-formed email address
+    Unauthorized:
+      description: Missing, invalid or expired JWT, or wrong credentials (`AUTHENTICATION_FAILED`)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            timestamp: '2026-11-18T10:15:30Z'
+            status: 401
+            error: Unauthorized
+            code: AUTHENTICATION_FAILED
+            message: Invalid credentials or token
+            path: /api/v1/orders
+    Forbidden:
+      description: Authenticated but lacking the required role (`ACCESS_DENIED`)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            timestamp: '2026-11-18T10:15:30Z'
+            status: 403
+            error: Forbidden
+            code: ACCESS_DENIED
+            message: Access is denied
+            path: /api/v1/admin/products
+    NotFound:
+      description: Resource not found, or not owned by the caller (`NOT_FOUND`)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            timestamp: '2026-11-18T10:15:30Z'
+            status: 404
+            error: Not Found
+            code: NOT_FOUND
+            message: Order 42 not found
+            path: /api/v1/orders/42
+    Conflict:
+      description: |
+        State conflict: `EMAIL_ALREADY_REGISTERED`, `DUPLICATE_RESOURCE`, `CONCURRENT_MODIFICATION`,
+        `PRODUCT_INACTIVE`, `INSUFFICIENT_STOCK`, `INVALID_ORDER_STATE`, `CANCELLATION_WINDOW_EXPIRED`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            timestamp: '2026-11-18T10:15:30Z'
+            status: 409
+            error: Conflict
+            code: CANCELLATION_WINDOW_EXPIRED
+            message: Order can only be cancelled within 48 hours of placement
+            path: /api/v1/orders/42/cancel
+    PaymentDeclined:
+      description: Simulated payment was declined (`PAYMENT_DECLINED`). The order remains PENDING_PAYMENT.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            timestamp: '2026-11-18T10:15:30Z'
+            status: 402
+            error: Payment Required
+            code: PAYMENT_DECLINED
+            message: Payment was declined by the issuer
+            path: /api/v1/orders/42/payments
+    InternalError:
+      description: Unexpected server error (`INTERNAL_ERROR`). No stack trace or request data is returned.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            timestamp: '2026-11-18T10:15:30Z'
+            status: 500
+            error: Internal Server Error
+            code: INTERNAL_ERROR
+            message: Unexpected error
+            path: /api/v1/orders
+
+  # --------------------------------------------------------------- SCHEMAS
+  schemas:
+    # ---- common
+    Money:
+      type: number
+      format: double
+      minimum: 0
+      description: Amount in INR (₹) with two fraction digits
+      example: 499.0
+
+    PageMetadata:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page:
+          type: integer
+          description: Zero-based page index
+          example: 0
+        size:
+          type: integer
+          example: 20
+        totalElements:
+          type: integer
+          format: int64
+          example: 57
+        totalPages:
+          type: integer
+          example: 3
+
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_FAILED
+        - AUTHENTICATION_FAILED
+        - ACCESS_DENIED
+        - NOT_FOUND
+        - PRODUCT_INACTIVE
+        - EMAIL_ALREADY_REGISTERED
+        - DUPLICATE_RESOURCE
+        - CONCURRENT_MODIFICATION
+        - INSUFFICIENT_STOCK
+        - EMPTY_CART
+        - INSUFFICIENT_GIFT_POINTS
+        - POINTS_LIMIT_EXCEEDED
+        - INVALID_ORDER_STATE
+        - CANCELLATION_WINDOW_EXPIRED
+        - INVALID_PAYMENT_DETAILS
+        - PAYMENT_DECLINED
+        - INTERNAL_ERROR
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          example: email
+        message:
+          type: string
+          description: Validation message. Never contains the rejected value.
+          example: must be a well-formed email address
+
+    ErrorResponse:
+      type: object
+      required: [timestamp, status, error, code, message, path]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        status:
+          type: integer
+          example: 400
+        error:
+          type: string
+          description: HTTP reason phrase
+          example: Bad Request
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+        path:
+          type: string
+        fieldErrors:
+          type: array
+          description: Present only for `VALIDATION_FAILED`
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    # ---- auth / user
+    Role:
+      type: string
+      enum: [CUSTOMER, ADMIN]
+
+    RegisterRequest:
+      type: object
+      required: [fullName, email, password]
+      properties:
+        fullName:
+          type: string
+          minLength: 2
+          maxLength: 100
+        email:
+          type: string
+          format: email
+          maxLength: 150
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 8
+          maxLength: 72
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).{8,72}$'
+          description: |
+            8 to 72 characters with at least one letter and one digit. The UTF-8 encoded password must also
+            not exceed 72 bytes (BCrypt input limit), so multi-byte characters may reduce the usable length.
+        phone:
+          type: string
+          description: 10-digit Indian mobile number
+          pattern: '^[6-9][0-9]{9}$'
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 150
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          description: |
+            No maximum length is declared on purpose. A password over 72 UTF-8 bytes is answered with
+            `401 AUTHENTICATION_FAILED`, the same as a wrong password.
+
+    UserResponse:
+      type: object
+      required: [id, fullName, email, role, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+        fullName:
+          type: string
+        email:
+          type: string
+          format: email
+        phone:
+          type: string
+          nullable: true
+        role:
+          $ref: '#/components/schemas/Role'
+        createdAt:
+          type: string
+          format: date-time
+
+    AuthResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn, user]
+      properties:
+        accessToken:
+          type: string
+          description: Signed JWT
+        tokenType:
+          type: string
+          enum: [Bearer]
+        expiresIn:
+          type: integer
+          description: Token lifetime in seconds
+          example: 3600
+        user:
+          $ref: '#/components/schemas/UserResponse'
+
+    # ---- catalogue
+    Category:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+          example: Fiction
+        description:
+          type: string
+          nullable: true
+
+    CategoryRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 500
+
+    Brand:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+          example: Penguin Random House
+        description:
+          type: string
+          nullable: true
+
+    BrandRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 500
+
+    Product:
+      type: object
+      required: [id, title, author, isbn, price, category, brand, stockQty, inStock, estimatedDeliveryDate]
+      properties:
+        id:
+          type: integer
+          format: int64
+        title:
+          type: string
+          example: The Pragmatic Programmer
+        author:
+          type: string
+          example: Andrew Hunt
+        isbn:
+          type: string
+          example: '9780135957059'
+        description:
+          type: string
+          nullable: true
+        price:
+          $ref: '#/components/schemas/Money'
+        imageUrl:
+          type: string
+          format: uri
+          nullable: true
+        category:
+          $ref: '#/components/schemas/Category'
+        brand:
+          $ref: '#/components/schemas/Brand'
+        stockQty:
+          type: integer
+          minimum: 0
+        inStock:
+          type: boolean
+        estimatedDeliveryDate:
+          type: string
+          format: date
+          description: Tentative delivery date = today + dispatch days + configured transit days
+          example: '2026-11-24'
+        version:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Optimistic-lock version of the product. Admin clients send it back in `ProductRequest.version`
+            when updating, to detect that the product was changed since it was read.
+
+    ProductRequest:
+      type: object
+      required: [title, author, isbn, price, stockQty, dispatchDays, categoryId, brandId]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        author:
+          type: string
+          minLength: 1
+          maxLength: 150
+        isbn:
+          type: string
+          pattern: '^([0-9]{10}|[0-9]{13})$'
+          description: ISBN-10 or ISBN-13 digits without hyphens
+        description:
+          type: string
+          maxLength: 2000
+        price:
+          type: number
+          format: double
+          minimum: 0.01
+        imageUrl:
+          type: string
+          format: uri
+          maxLength: 500
+        stockQty:
+          type: integer
+          minimum: 0
+        dispatchDays:
+          type: integer
+          minimum: 0
+          maximum: 30
+          description: Days needed to dispatch before transit
+        categoryId:
+          type: integer
+          format: int64
+          minimum: 1
+        brandId:
+          type: integer
+          format: int64
+          minimum: 1
+        active:
+          type: boolean
+          default: true
+        version:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Optional, update only. The `version` last read from the product. If it is no longer current, the
+            update is refused with `409 CONCURRENT_MODIFICATION`. If omitted, the update applies to the current
+            state, but is still refused with the same 409 if the product is changed concurrently while saving.
+
+    ProductPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMetadata'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/Product'
+
+    RecommendedProduct:
+      type: object
+      required: [product, reason]
+      properties:
+        product:
+          $ref: '#/components/schemas/Product'
+        reason:
+          type: string
+          description: Human-readable explanation
+          example: Because you bought books in Fiction
+
+    # ---- cart
+    CartItemAddRequest:
+      type: object
+      required: [productId, quantity]
+      properties:
+        productId:
+          type: integer
+          format: int64
+          minimum: 1
+        quantity:
+          type: integer
+          minimum: 1
+          description: Further limited by stock and `bookstore.cart.max-quantity-per-item`
+
+    CartItemUpdateRequest:
+      type: object
+      required: [quantity]
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+          description: Further limited by stock and `bookstore.cart.max-quantity-per-item`
+
+    CartItem:
+      type: object
+      required: [product, quantity, unitPrice, lineTotal]
+      properties:
+        product:
+          $ref: '#/components/schemas/Product'
+        quantity:
+          type: integer
+          minimum: 1
+        unitPrice:
+          $ref: '#/components/schemas/Money'
+        lineTotal:
+          $ref: '#/components/schemas/Money'
+
+    CartResponse:
+      type: object
+      required: [items, itemCount, subtotal, maxRedeemablePoints, currency]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CartItem'
+        itemCount:
+          type: integer
+          minimum: 0
+          description: Total quantity across all lines
+        subtotal:
+          $ref: '#/components/schemas/Money'
+        maxRedeemablePoints:
+          type: integer
+          minimum: 0
+          description: min(balance, floor(subtotal * max-redemption-percent / 100 / point-value))
+        estimatedDeliveryDate:
+          type: string
+          format: date
+          description: Latest line estimate. Omitted for an empty cart.
+        currency:
+          type: string
+          enum: [INR]
+
+    # ---- address
+    AddressRequest:
+      type: object
+      required: [line1, city, state, postalCode]
+      properties:
+        label:
+          type: string
+          maxLength: 50
+          example: Home
+        line1:
+          type: string
+          minLength: 1
+          maxLength: 150
+        line2:
+          type: string
+          maxLength: 150
+        city:
+          type: string
+          minLength: 1
+          maxLength: 80
+        state:
+          type: string
+          minLength: 1
+          maxLength: 80
+        postalCode:
+          type: string
+          description: 6-digit Indian PIN code
+          pattern: '^[1-9][0-9]{5}$'
+        country:
+          type: string
+          maxLength: 60
+          default: India
+        isDefault:
+          type: boolean
+          default: false
+
+    Address:
+      type: object
+      required: [id, line1, city, state, postalCode, country, isDefault]
+      properties:
+        id:
+          type: integer
+          format: int64
+        label:
+          type: string
+          nullable: true
+        line1:
+          type: string
+        line2:
+          type: string
+          nullable: true
+        city:
+          type: string
+        state:
+          type: string
+        postalCode:
+          type: string
+        country:
+          type: string
+        isDefault:
+          type: boolean
+
+    AddressSnapshot:
+      type: object
+      description: Immutable copy of the delivery address taken when the order was placed
+      required: [line1, city, state, postalCode, country]
+      properties:
+        label:
+          type: string
+          nullable: true
+        line1:
+          type: string
+        line2:
+          type: string
+          nullable: true
+        city:
+          type: string
+        state:
+          type: string
+        postalCode:
+          type: string
+        country:
+          type: string
+
+    # ---- orders
+    OrderStatus:
+      type: string
+      description: |
+        PENDING_PAYMENT, then CONFIRMED, then SHIPPED, then DELIVERED. CANCELLED is reachable only from
+        PENDING_PAYMENT and CONFIRMED.
+      enum: [PENDING_PAYMENT, CONFIRMED, SHIPPED, DELIVERED, CANCELLED]
+
+    CreateOrderRequest:
+      type: object
+      required: [addressId]
+      properties:
+        addressId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Must belong to the authenticated user
+        pointsToRedeem:
+          type: integer
+          minimum: 0
+          default: 0
+          description: |
+            Gift points to redeem (1 point = ₹1 by default). Must not exceed the balance or
+            `max-redemption-percent` (default 50%) of the subtotal.
+
+    CancelOrderRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 255
+
+    OrderItem:
+      type: object
+      required: [productId, title, unitPrice, quantity, lineTotal, estimatedDeliveryDate]
+      properties:
+        productId:
+          type: integer
+          format: int64
+        title:
+          type: string
+          description: Title snapshot at purchase time
+        author:
+          type: string
+          nullable: true
+        unitPrice:
+          $ref: '#/components/schemas/Money'
+        quantity:
+          type: integer
+          minimum: 1
+        lineTotal:
+          $ref: '#/components/schemas/Money'
+        estimatedDeliveryDate:
+          type: string
+          format: date
+
+    OrderResponse:
+      type: object
+      required:
+        - id
+        - orderNumber
+        - status
+        - items
+        - shippingAddress
+        - subtotal
+        - pointsRedeemed
+        - pointsDiscount
+        - totalAmount
+        - pointsEarned
+        - currency
+        - placedAt
+        - estimatedDeliveryDate
+        - cancellable
+      properties:
+        id:
+          type: integer
+          format: int64
+        orderNumber:
+          type: string
+          example: BK-20261118-000042
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        shippingAddress:
+          $ref: '#/components/schemas/AddressSnapshot'
+        subtotal:
+          $ref: '#/components/schemas/Money'
+        pointsRedeemed:
+          type: integer
+          minimum: 0
+        pointsDiscount:
+          $ref: '#/components/schemas/Money'
+        totalAmount:
+          $ref: '#/components/schemas/Money'
+        pointsEarned:
+          type: integer
+          minimum: 0
+          description: Points credited for this order (0 until payment succeeds)
+        currency:
+          type: string
+          enum: [INR]
+        placedAt:
+          type: string
+          format: date-time
+        estimatedDeliveryDate:
+          type: string
+          format: date
+          description: Latest estimate over all items
+        cancellable:
+          type: boolean
+          description: True when the status allows cancellation and the window has not expired
+        cancellableUntil:
+          type: string
+          format: date-time
+          description: placedAt plus the cancellation window
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+        payment:
+          description: Latest payment attempt. Omitted when no payment has been attempted.
+          allOf:
+            - $ref: '#/components/schemas/PaymentResponse'
+
+    OrderSummary:
+      type: object
+      required: [id, orderNumber, status, itemCount, totalAmount, placedAt, estimatedDeliveryDate, cancellable]
+      properties:
+        id:
+          type: integer
+          format: int64
+        orderNumber:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        itemCount:
+          type: integer
+          minimum: 1
+        firstItemTitle:
+          type: string
+          description: Title of the first item, for list display
+        totalAmount:
+          $ref: '#/components/schemas/Money'
+        placedAt:
+          type: string
+          format: date-time
+        estimatedDeliveryDate:
+          type: string
+          format: date
+        cancellable:
+          type: boolean
+
+    OrderSummaryPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMetadata'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/OrderSummary'
+
+    BuyAgainItem:
+      type: object
+      required: [product, timesOrdered, lastOrderedAt]
+      properties:
+        product:
+          $ref: '#/components/schemas/Product'
+        timesOrdered:
+          type: integer
+          minimum: 1
+        lastOrderedAt:
+          type: string
+          format: date-time
+
+    # ---- payments
+    PaymentMethod:
+      type: string
+      description: Only credit and debit cards are supported (IBM wireframe)
+      enum: [CREDIT_CARD, DEBIT_CARD]
+
+    PaymentStatus:
+      type: string
+      enum: [SUCCESS, FAILED, REFUNDED]
+
+    PaymentRequest:
+      type: object
+      required: [method, cardHolderName, cardNumber, expiryMonth, expiryYear, cvv]
+      properties:
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        cardHolderName:
+          type: string
+          minLength: 2
+          maxLength: 100
+        cardNumber:
+          type: string
+          format: password
+          writeOnly: true
+          pattern: '^[0-9]{13,19}$'
+          description: |
+            Digits only and Luhn-valid. Validated in memory. Never stored, returned or logged;
+            only the last 4 digits are kept.
+        expiryMonth:
+          type: integer
+          minimum: 1
+          maximum: 12
+        expiryYear:
+          type: integer
+          minimum: 1000
+          maximum: 9999
+          description: |
+            Four-digit year. Only the structure is fixed here; whether the card is expired is validated
+            dynamically against the current month and year on the server.
+        cvv:
+          type: string
+          format: password
+          writeOnly: true
+          pattern: '^[0-9]{3,4}$'
+          description: Validated in memory only. Never stored, returned or logged.
+
+    PaymentResponse:
+      type: object
+      description: Never contains the full card number or CVV
+      required: [id, orderId, method, status, amount, cardLast4, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+        orderId:
+          type: integer
+          format: int64
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          $ref: '#/components/schemas/Money'
+        transactionRef:
+          type: string
+          nullable: true
+          example: TXN-8F3A91C2
+        cardLast4:
+          type: string
+          pattern: '^[0-9]{4}$'
+          example: '1111'
+        failureReason:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    PaymentConfirmationResponse:
+      type: object
+      required: [payment, order, pointsEarned, message]
+      properties:
+        payment:
+          $ref: '#/components/schemas/PaymentResponse'
+        order:
+          $ref: '#/components/schemas/OrderResponse'
+        pointsEarned:
+          type: integer
+          minimum: 0
+        message:
+          type: string
+          example: Payment successful. Your order BK-20261118-000042 is confirmed.
+
+    # ---- gift points
+    GiftPointTransactionType:
+      type: string
+      description: |
+        EARN (payment success), REDEEM (order placement), REFUND (redeemed points returned on cancellation),
+        REVERSE (earned points taken back on cancellation).
+      enum: [EARN, REDEEM, REFUND, REVERSE]
+
+    GiftPointTransaction:
+      type: object
+      required: [id, type, points, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+        type:
+          $ref: '#/components/schemas/GiftPointTransactionType'
+        points:
+          type: integer
+          description: Signed change applied to the balance (negative for REDEEM and REVERSE)
+          example: -100
+        orderId:
+          type: integer
+          format: int64
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    GiftPointTransactionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMetadata'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/GiftPointTransaction'
+
+    GiftPointRules:
+      type: object
+      required: [earnPointsPerUnit, earnSpendUnit, pointValue, maxRedemptionPercent]
+      properties:
+        earnPointsPerUnit:
+          type: integer
+          minimum: 1
+          example: 1
+        earnSpendUnit:
+          $ref: '#/components/schemas/Money'
+        pointValue:
+          $ref: '#/components/schemas/Money'
+        maxRedemptionPercent:
+          type: integer
+          minimum: 0
+          maximum: 50
+          example: 50
+
+    GiftPointsResponse:
+      type: object
+      required: [balance, rules, transactions]
+      properties:
+        balance:
+          type: integer
+          minimum: 0
+        rules:
+          $ref: '#/components/schemas/GiftPointRules'
+        transactions:
+          $ref: '#/components/schemas/GiftPointTransactionPage'
